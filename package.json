@@ -13,6 +13,14 @@
     "jest": "^29.7.0"
   },
   "dependencies": {
-    "jsdom": "^24.1.1"
+    "bull": "^4.16.0",
+    "franc-min": "^6.2.0",
+    "ioredis": "^5.4.1",
+    "jsdom": "^24.1.1",
+    "keyword-extractor": "^0.0.28",
+    "languagedetect": "^2.0.0",
+    "mongodb": "^6.8.0",
+    "node-fetch": "^3.3.2",
+    "redis": "^4.7.0"
   }
 }
