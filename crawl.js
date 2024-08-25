@@ -4,7 +4,6 @@ const keywordExtractor = require('keyword-extractor');
 const Bull = require('bull');
 const Redis = require('ioredis');
 
-
 // Redis and MongoDB connection details
 const REDIS_URL = 'redis://127.0.0.1:6379';
 const MONGO_URI = 'mongodb+srv://arkadeep:ZbIDql0NPpSbDpF1@sdd.pojzlat.mongodb.net/';
@@ -114,10 +113,9 @@ const crawlPage = throttleRequests(async (baseURL, currentURL, db) => {
             console.log(`Invalid URL: ${currentURL}`);
             return; // Skip processing for invalid URLs
         }
-
+        console.log(normalizedCurrentURL)
         // Fetch the page
         const resp = await fetch(normalizedCurrentURL);
-
         if (resp.status > 399) {
             console.log(`Error fetching page: ${resp.statusText}`);
             return;
@@ -130,9 +128,16 @@ const crawlPage = throttleRequests(async (baseURL, currentURL, db) => {
         }
 
         const htmlBody = await resp.text();
-        const nextUrls = await getURLsfromHTML(htmlBody, baseURL);
+        const dom = new JSDOM(htmlBody);
+        const document = dom.window.document;
 
-        // Extract and save keywords and metadata
+        if (!document) {
+            console.log(`Failed to parse HTML for URL: ${normalizedCurrentURL}`);
+            return;
+        }
+
+        // Extract URLs and metadata
+        const nextUrls = await getURLsfromHTML(htmlBody, baseURL);
         const siteType = await extractAndSaveData(htmlBody, normalizedCurrentURL, db);
 
         // Process URLs from other domains before revisiting the same domain
@@ -164,25 +169,19 @@ const crawlPage = throttleRequests(async (baseURL, currentURL, db) => {
             }
         }
     } catch (err) {
-        console.log(`Error processing URL ${currentURL}: ${err.message}`);
+        console.error(`Error processing URL ${currentURL}: ${err.message}`);
     }
 });
-
 // Extract data, classify website type, and save to MongoDB
 async function extractAndSaveData(htmlBody, url, db) {
     const dom = new JSDOM(htmlBody);
     const document = dom.window.document;
 
-    // Extract text content excluding <script> and <style> tags
-    const textContent = [...document.body.querySelectorAll('*')]
-        .filter(element => element.tagName !== 'SCRIPT' && element.tagName !== 'STYLE')
-        .map(element => element.textContent)
-        .join(' ');
-
+    // Extract and save text content
+    const textContent = extractTextContent(document);
     const paragraphs = Array.from(document.querySelectorAll('p'))
         .map(p => p.textContent.trim())
         .filter(text => text.length > 0);
-
     const joinedPara = [...paragraphs].join(' ');
 
     const keywords = keywordExtractor.extract(textContent, {
@@ -192,22 +191,43 @@ async function extractAndSaveData(htmlBody, url, db) {
         remove_duplicates: true,
     });
 
-    // Extract meta description and title
     const description = document.querySelector("meta[name='description']")?.getAttribute("content") || joinedPara;
     const title = document.querySelector("title")?.textContent || "";
 
-    // Determine site type based on extracted keywords or metadata
     const siteType = classifyWebsiteType(keywords, description);
 
+    // Extract images with their alt text
+    const images = [...document.querySelectorAll('img')].map(img => ({
+        src: img.src,
+        alt: img.alt || '' // Provide a default empty string if alt is not available
+    }));
+
+    // Extract videos
+    const videos = [...document.querySelectorAll('video')].map(video => video.src);
+
+    // Extract products from e-commerce pages
+    const products = extractEcommerceData(document, new URL(url).hostname);
+
+    // Save data to MongoDB
     const collection = db.collection('keywords');
+
     try {
-        await collection.insertOne({
-            url,
-            title,
-            description,
-            keywords,
-            siteType,
-        });
+        await collection.updateOne(
+            { url },
+            {
+                $set: {
+                    title,
+                    description,
+                    keywords,
+                    siteType,
+                    content: textContent,
+                    images, // Save image objects with src and alt
+                    videos,
+                    price: products
+                }
+            },
+            { upsert: true } // Update if exists, insert if not
+        );
         console.log(`Data saved for ${url}`);
     } catch (err) {
         console.error(`Failed to insert data for ${url}:`, err);
@@ -216,34 +236,73 @@ async function extractAndSaveData(htmlBody, url, db) {
     return siteType;
 }
 
+
 // Function to classify website type
 function classifyWebsiteType(keywords, metaDescription) {
-    const newsKeywords = ["news", "breaking", "update"];
-    const blogKeywords = ["blog", "post", "comment"];
-    const ecommerceKeywords = ["buy", "shop", "price"];
+    const types = {
+        'news': ['news', 'breaking', 'update'],
+        'blog': ['blog', 'post', 'comment'],
+        'ecommerce': ['buy', 'shop', 'price'],
+        'socialmedia': ['social', 'tweet', 'facebook', 'instagram'],
+    };
 
-    // Simple classification logic
-    if (keywords.some(keyword => newsKeywords.includes(keyword))) {
-        return "news";
-    } else if (keywords.some(keyword => blogKeywords.includes(keyword))) {
-        return "blog";
-    } else if (keywords.some(keyword => ecommerceKeywords.includes(keyword))) {
-        return "ecommerce";
-    } else {
-        return "other";
-    }
+    const keywordMap = Object.keys(types).find(type => 
+        keywords.some(keyword => types[type].includes(keyword))
+    );
+
+    if (keywordMap) return keywordMap;
+
+    const descriptionKeywords = metaDescription.toLowerCase();
+    if (descriptionKeywords.includes('news')) return 'news';
+    if (descriptionKeywords.includes('blog')) return 'blog';
+    if (descriptionKeywords.includes('buy') || descriptionKeywords.includes('shop')) return 'ecommerce';
+    if (descriptionKeywords.includes('social')) return 'socialmedia';
+
+    return 'other';
 }
 
-// Determine recrawl priority based on website type
-function determineRecrawlPriority(siteType) {
-    switch (siteType) {
-        case 'news':
-            return 'high'; // Frequently updated
-        case 'blog':
-        case 'ecommerce':
-            return 'low'; // Less frequently updated
+// Determine recrawl priority based on website type and other factors
+function determineRecrawlPriority(siteType, updateFrequency = 'medium', importance = 'medium') {
+    // Define priority levels for different site types
+    const siteTypePriority = {
+        news: 'high',        // News sites are frequently updated
+        socialmedia: 'high', // Social media sites are frequently updated
+        ecommerce: 'medium', // E-commerce sites are updated less frequently but still regularly
+        blog: 'medium',      // Blogs are updated occasionally
+        forum: 'medium',     // Forums may have occasional updates
+        corporate: 'low',    // Corporate sites are updated infrequently
+        educational: 'low',  // Educational sites may have occasional updates
+        other: 'low'         // Other or uncategorized sites default to low
+    };
+
+    // Adjust priority based on additional factors
+    const updateFrequencyAdjustment = {
+        high: 1,
+        medium: 0,
+        low: -1
+    };
+
+    const importanceAdjustment = {
+        high: 1,
+        medium: 0,
+        low: -1
+    };
+
+    // Calculate base priority
+    let basePriority = siteTypePriority[siteType] || 'low'; // Default to 'low' if siteType not found
+
+    // Adjust priority based on update frequency and importance
+    let priorityAdjustment = updateFrequencyAdjustment[updateFrequency] + importanceAdjustment[importance];
+    
+    // Calculate final priority level
+    switch (basePriority) {
+        case 'high':
+            return priorityAdjustment > 0 ? 'high' : 'medium';
+        case 'medium':
+            return priorityAdjustment > 0 ? 'high' : (priorityAdjustment < 0 ? 'low' : 'medium');
+        case 'low':
         default:
-            return 'low'; // Default to low
+            return priorityAdjustment < 0 ? 'low' : 'medium';
     }
 }
 
@@ -261,30 +320,152 @@ async function getURLsfromHTML(htmlBody, baseURL) {
 
         // Ignore links that are neither relative nor absolute
         if (!href || (!href.startsWith('/') && !href.startsWith('http'))) {
-            console.log(`Ignored non-relative or non-absolute link: ${href}`);
             continue;
         }
 
-        // Convert relative URLs to absolute URLs
-        try {
-            href = new URL(href, baseURL).href;
-        } catch (err) {
-            console.error(`Failed to convert relative URL to absolute: ${err.message}`);
+        // Check if the link contains any of the filter keywords
+        if (filterKeywords.some(keyword => href.toLowerCase().includes(keyword))) {
             continue;
         }
 
-        const isFiltered = filterKeywords.some(keyword => href.includes(keyword));
-        if (!isFiltered && !href.includes('#')) {
-            urls.push(href);
-        } else {
-            console.log(`Filtered out unwanted link: ${href}`);
+        // Resolve relative URLs
+        const url = new URL(href, baseURL).href;
+        if (!urls.includes(url)) {
+            urls.push(url);
         }
     }
 
     return urls;
 }
 
-// Normalize URLs to avoid duplicate processing
+// Extract text content from HTML and filter out styles/scripts
+// Extract text content excluding <script> and <style> tags and remove inline styles
+function extractTextContent(document) {
+    if (!document) {
+        throw new Error("Document is not initialized.");
+    }
+
+    // Remove <style> and <script> tags
+    const elementsToRemove = document.querySelectorAll('style, script');
+    elementsToRemove.forEach(element => {
+        console.log(`Removing element: ${element.tagName}`);
+        element.remove();
+    });
+
+    // Optionally remove other non-content elements
+    const tagsToRemove = ['footer', 'nav', 'header'];
+    tagsToRemove.forEach(tag => {
+        const elements = document.querySelectorAll(tag);
+        elements.forEach(element => {
+            console.log(`Removing element: ${tag.toUpperCase()}`);
+            element.remove();
+        });
+    });
+
+    // Extract text from remaining content
+    const textContent = [...document.body.querySelectorAll('*')]
+        .filter(element => element.tagName !== 'STYLE' && element.tagName !== 'SCRIPT')
+        .map(element => {
+            // Remove any inline styles or scripts embedded within tags
+            let text = element.textContent || '';
+            text = text.replace(/<style[^>]*>.*?<\/style>/gi, ''); // Remove inline style elements
+            text = text.replace(/<script[^>]*>.*?<\/script>/gi, ''); // Remove inline script elements
+            return text.trim();
+        })
+        .filter(text => text.length > 0) // Remove empty text nodes
+        .join(' ');
+
+    return textContent;
+}
+
+
+
+// Extract product information from ecommerce pages with custom rules
+// Define custom rules for specific domains
+const customScrapingRules = {
+    "amazon.com": {
+        "productSelector": '.s-main-slot .s-result-item',
+        "nameSelector": '.a-size-medium',
+        "priceSelector": '.a-price-whole'
+    },
+    "ebay.com": {
+        "productSelector": '.s-item',
+        "nameSelector": '.s-item__title',
+        "priceSelector": '.s-item__price'
+    }
+    // Add more domain-specific rules as needed
+};
+
+// Function to determine if there are custom rules for a domain
+function getCustomRulesForDomain(domain) {
+    return customScrapingRules[domain] || null;
+}
+
+// Updated extractEcommerceData function using custom rules
+function extractEcommerceData(document, domain) {
+    const products = [];
+    const customRules = getCustomRulesForDomain(domain);
+    
+    if (customRules) {
+        const productElements = document.querySelectorAll(customRules.productSelector);
+        productElements.forEach(productElement => {
+            const productName = productElement.querySelector(customRules.nameSelector)?.textContent.trim() || '';
+            const productPrice = productElement.querySelector(customRules.priceSelector)?.textContent.trim() || '';
+            products.push({ name: productName, price: productPrice });
+        });
+    } else {
+        // Fallback to generic selectors if no custom rules are defined
+        const possibleProductSelectors = [
+            '[class*="product"]', '[class*="item"]', '[id*="product"]', '[id*="item"]'
+        ];
+        const productElements = document.querySelectorAll(possibleProductSelectors.join(', '));
+        
+        productElements.forEach(productElement => {
+            let productName = '';
+            let productPrice = '';
+
+            const nameSelectors = [
+                '[class*="name"]', '[class*="title"]', '[itemprop*="name"]',
+                'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a'
+            ];
+            for (const selector of nameSelectors) {
+                const nameElement = productElement.querySelector(selector);
+                if (nameElement && nameElement.textContent.trim()) {
+                    productName = nameElement.textContent.trim();
+                    break;
+                }
+            }
+
+            const priceSelectors = [
+                '[class*="price"]', '[itemprop*="price"]', '.price', '.cost',
+                '.amount', '[class*="amount"]'
+            ];
+            for (const selector of priceSelectors) {
+                const priceElement = productElement.querySelector(selector);
+                if (priceElement && priceElement.textContent.trim()) {
+                    productPrice = extractPrice(priceElement.textContent.trim());
+                    break;
+                }
+            }
+
+            if (productName || productPrice) {
+                products.push({ name: productName, price: productPrice });
+            }
+        });
+    }
+
+    return products;
+}
+
+// Function to extract price using regex
+function extractPrice(text) {
+    // Regex pattern to match prices (supports various formats and currencies)
+    const priceRegex = /(?:[$£€¥₹]|\bUSD|\bEUR|\bGBP|\bJPY|\bINR)?\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/;
+    const match = text.match(priceRegex);
+    return match ? match[0] : '';
+}
+
+// Normalize URL
 function normalizeURL(url) {
     try {
         const normalizedUrl = new URL(url);
@@ -296,6 +477,7 @@ function normalizeURL(url) {
         return null;
     }
 }
+
 
 module.exports = {
     addUrlToQueue

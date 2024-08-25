@@ -10,20 +10,35 @@ async function main() {
     const baseURL = process.argv[2];
 
     // Validate the provided URL
+    let validUrl;
     try {
-        new URL(baseURL);
+        validUrl = new URL(baseURL);
     } catch (err) {
         console.error("Invalid URL provided. Please enter a valid URL.");
         process.exit(1);
     }
 
+    // Further validate that the URL is reachable (optional)
+    try {
+        const response = await fetch(validUrl.href);
+        if (!response.ok) {
+            throw new Error(`URL returned status code ${response.status}`);
+        }
+    } catch (err) {
+        console.error(`Error validating URL: ${err.message}`);
+        process.exit(1);
+    }
 
-    console.log(`Starting crawl of ${baseURL}`);
+    console.log(`Starting crawl of ${validUrl.href}`);
 
     // Add the base URL to the queue to start crawling
-    await addUrlToQueue(baseURL, 'high');
-
-    console.log(`Crawl initiated for ${baseURL}`);
+    try {
+        await addUrlToQueue(validUrl.href, 'high');
+        console.log(`Crawl initiated for ${validUrl.href}`);
+    } catch (err) {
+        console.error(`Failed to add URL to queue: ${err.message}`);
+        process.exit(1);
+    }
 }
 
 // Call the main function and handle any unexpected errors
